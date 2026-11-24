@@ -7,6 +7,8 @@ from enum import Enum
 from typing import Callable
 
 import matplotlib.pyplot as plt
+from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TextColumn,
+                           TimeElapsedColumn, TimeRemainingColumn)
 
 
 class Strategy(str, Enum):
@@ -254,35 +256,41 @@ def run_soma(
     return swarm.history
 
 
-def run_experiment(
-    objective_names: list[str] | None = None,
-    runs: int = RUNS_NO,
-):
-    """
-    Returns {objective: {dimension: {strategy: [convergence_history per run]}}}
-    """
+def run_experiment(objective_names=None, runs=RUNS_NO):
     if objective_names is None:
         objective_names = list(OBJECTIVES.keys())
 
-    if abs(1 / STEP - round(1 / STEP)) < 1e-9:
-        warnings.warn("STEP divides 1 exactly - particles will hit evaluated points")
+    total = len(objective_names) * len(DIMENSIONS) * len(Strategy) * runs
+    results = {}
 
-    results: dict[str, dict[int, dict[str, list[list[float]]]]] = {}
+    with Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task("SOMA", total=total)
 
-    for obj_name in objective_names:
-        obj_func, bounds = OBJECTIVES[obj_name]
-        results[obj_name] = {}
+        for obj_name in objective_names:
+            obj_func, bounds = OBJECTIVES[obj_name]
+            results[obj_name] = {}
 
-        for dim in DIMENSIONS:
-            results[obj_name][dim] = {}
-            max_evals = EVALS_PER_DIM * dim
+            for dim in DIMENSIONS:
+                results[obj_name][dim] = {}
+                max_evals = EVALS_PER_DIM * dim
 
-            for strategy in Strategy:
-                results[obj_name][dim][strategy.value] = [
-                    run_soma(obj_func, bounds, dim, max_evals, strategy)
-                    for _ in range(runs)
-                ]
-                print(f"done: {obj_name} dim={dim} {strategy.value}")
+                for strategy in Strategy:
+                    progress.update(
+                        task, description=f"{obj_name} d={dim} {strategy.value}"
+                    )
+                    histories = []
+                    for _ in range(runs):
+                        histories.append(
+                            run_soma(obj_func, bounds, dim, max_evals, strategy)
+                        )
+                        progress.advance(task)
+                    results[obj_name][dim][strategy.value] = histories
 
     return results
 
