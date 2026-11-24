@@ -1,7 +1,10 @@
 import math
 import os
 import random
+import statistics
+import warnings
 from enum import Enum
+from typing import Callable
 
 import matplotlib.pyplot as plt
 
@@ -12,15 +15,20 @@ class Strategy(str, Enum):
     ALL_TO_ALL = "all to all"
 
 
-STRATEGY = Strategy.ALL_TO_ONE
-PATH_LENGTH = 1.7
-STEP = 0.27
+PATH_LENGTH = 1.7  # > 1 so we also search beyond the target
+STEP = 0.27  # fraction of the path between two evaluations (should not divide 1)
+PRT = 0.3  # probability that a dimension follows the trajectory
 SEED = 42
 
 RUNS_NO = 10
 POPULATION_SIZE = 50
 EVALS_PER_DIM = 1000
 DIMENSIONS = (10, 30)
+LOG_EVERY = POPULATION_SIZE  # store best-so-far every N evaluations
+
+
+class BudgetExhausted(Exception):
+    """Raised when the maximum number of function evaluations is reached."""
 
 
 # objective functions (minimization), each with its search range (lower, upper)
@@ -62,32 +70,62 @@ class Particle:
         self.best_fitness = math.inf
         self.velocity = [0.0] * dimension
 
-    def in_bounds(self, bounds: tuple[float, float]) -> bool:
-        low, high = bounds
-        return all(low <= v <= high for v in self.position)
+    @staticmethod
+    def _prt_vector(dimension: int, prt: float) -> list[int]:
+        """1 = dimension follows the trajectory, 0 = it stays. At least one 1."""
+        while True:
+            vec = [1 if random.random() < prt else 0 for _ in range(dimension)]
+            if any(vec):
+                return vec
+
+    def in_bounds(self, candidate: list[float]) -> bool:
+        return all(self.low <= v <= self.high for v in candidate)
 
     def update_personal_best(self) -> None:
         if self.fitness < self.best_fitness:
             self.best_fitness = self.fitness
             self.best_position = self.position[:]
 
-    def move(
+    def explore(
         self,
-        strategy: Strategy,
-        global_best_position: list[float],
+        target: list[float],
         path_length: float,
         step_length: float,
-    ) -> None:
-        if strategy == Strategy.ALL_TO_ONE:
-            pass
-        elif strategy == Strategy.ALL_TO_RANDOM:
-            pass
-        elif strategy == Strategy.ALL_TO_ALL:
-            pass
+        prt: float,
+        evaluate: Callable[[list[float]], float],
+    ) -> tuple[list[float] | None, float]:
+        """
+        Walk from the current position towards `target` (and beyond, up to
+        `path_length`) in steps of `step_length` (both relative to the distance
+        to the target). Every in-bounds point is evaluated.
+        Returns the best point found that improves on the current fitness
+        (None if there is none) together with its fitness.
+        The particle itself is not moved.
+        """
+        prt_vector = self._prt_vector(len(self.position), prt)
+        n_steps = int(path_length / step_length + 1e-9)
 
-        # clamp
-        self.position = [max(self.low, min(self.high, p)) for p in self.position]
-        pass
+        best_pos: list[float] | None = None
+        best_fit = self.fitness
+
+        for k in range(1, n_steps + 1):
+            t = k * step_length
+            candidate = [
+                s + (g - s) * t * m
+                for s, g, m in zip(self.position, target, prt_vector)
+            ]
+            if not self.in_bounds(candidate):  # never evaluate outside bounds
+                continue
+            fit = evaluate(candidate)
+            if fit < best_fit:
+                best_fit, best_pos = fit, candidate
+
+        return best_pos, best_fit
+
+    def move(self, new_position: list[float], new_fitness: float) -> None:
+        self.position = new_position
+        self.fitness = new_fitness
+        self.update_personal_best()
 
 
 class Swarm:
@@ -97,149 +135,185 @@ class Swarm:
         strategy: Strategy,
         path_length: float,
         step_length: float,
+        prt: float,
         bounds: tuple[float, float],
-        objective,
+        objective: Callable[[list[float]], float],
+        max_evals: int,
     ):
         self.particles = particles
         self.strategy = strategy
         self.path_length = path_length
         self.step_length = step_length
+        self.prt = prt
         self.bounds = bounds
+        self.objective = objective
+        self.max_evals = max_evals
+
+        self.evals = 0
+        self.best_so_far = math.inf
+        self.history: list[float] = []  # best-so-far every LOG_EVERY evaluations
 
     def global_best(self) -> Particle:
         return min(self.particles, key=lambda p: p.best_fitness)
 
+    def initialize(self) -> None:
+        for p in self.particles:
+            p.fitness = self.evaluate(p.position)
+            p.update_personal_best()
+
+    def evaluate(self, position: list[float]) -> float:
+        """Counted objective evaluation; enforces the evaluation budget."""
+        if self.evals >= self.max_evals:
+            raise BudgetExhausted
+        self.evals += 1
+        fit = self.objective(position)
+        if fit < self.best_so_far:
+            self.best_so_far = fit
+        if self.evals % LOG_EVERY == 0:
+            self.history.append(self.best_so_far)
+        return fit
+
+    def _migrate(self, p: Particle, target: list[float]) -> None:
+        new_pos, new_fit = p.explore(
+            target, self.path_length, self.step_length, self.prt, self.evaluate
+        )
+        if new_pos is not None:
+            p.move(new_pos, new_fit)
+
     def step(self) -> None:
-        """
-        Perform one evolution step for the entire swarm.
-        """
         if self.strategy == Strategy.ALL_TO_ONE:
-            gb = self.global_best()
+            leader = self.global_best()
+            target = leader.best_position
             for particle in self.particles:
-                particle.move(
-                    self.strategy, gb.best_position, self.path_length, self.step_length
-                )
-                particle.fitness = OBJECTIVES["Sphere"][0](
-                    particle.position
-                )  # Example objective
-                particle.update_personal_best()
+                if particle is leader:
+                    continue
+                self._migrate(particle, target)
 
         elif self.strategy == Strategy.ALL_TO_RANDOM:
-            all_best_positions = [p.best_position for p in self.particles]
-            for particle in self.particles:
-                # todo remove itself so it cant go to itself
-                target = random.choice(all_best_positions)
-                particle.move(self.strategy, target, self.path_length, self.step_length)
-                particle.fitness = OBJECTIVES["Sphere"][0](particle.position)
-                particle.update_personal_best()
+            snapshot = [p.best_position for p in self.particles]
+            n = len(self.particles)
+            for i, particle in enumerate(self.particles):
+                j = random.randrange(n - 1)  # random index that is not i
+                if j >= i:
+                    j += 1
+                self._migrate(particle, snapshot[j])
 
         elif self.strategy == Strategy.ALL_TO_ALL:
-            # TODO
-            pass
+            # every particle explores the paths to all the others,
+            # then jumps to the best point it found among all of them
+            snapshot = [p.best_position for p in self.particles]
+            for i, particle in enumerate(self.particles):
+                best_pos: list[float] | None = None
+                best_fit = particle.fitness
+                for j, target in enumerate(snapshot):
+                    if j == i:
+                        continue
+                    pos, fit = particle.explore(
+                        target,
+                        self.path_length,
+                        self.step_length,
+                        self.prt,
+                        self.evaluate,
+                    )
+                    if pos is not None and fit < best_fit:
+                        best_pos, best_fit = pos, fit
+                if best_pos is not None:
+                    particle.move(best_pos, best_fit)
 
 
 def run_soma(
-    objective, bounds: tuple[float, float], dimension: int, max_evals: int
+    objective,
+    bounds: tuple[float, float],
+    dimension: int,
+    max_evals: int,
+    strategy: Strategy,
 ) -> list[float]:
     """
-    Run SOMA optimization for a single objective function.
+    Run SOMA for a single objective function with a fixed evaluation budget.
+    Returns best-so-far fitness sampled every LOG_EVERY evaluations.
     """
-    num_particles = 30
-    path_length = PATH_LENGTH
-    step_length = STEP
-
-    # Initialize particles
-    particles = [Particle(dimension, bounds) for _ in range(num_particles)]
+    particles = [Particle(dimension, bounds) for _ in range(POPULATION_SIZE)]
     swarm = Swarm(
-        particles, STRATEGY, path_length, step_length, bounds, objective.__name__
+        particles,
+        strategy,
+        PATH_LENGTH,
+        STEP,
+        PRT,
+        bounds,
+        objective,
+        max_evals,
     )
 
-    # Evaluate initial fitness
-    for p in particles:
-        p.fitness = objective(p.position)
-        p.update_personal_best()
+    try:
+        swarm.initialize()
+        while True:
+            swarm.step()
+    except BudgetExhausted:
+        pass
 
-    convergence_history = []
-    max_iterations = max_evals // (num_particles * 2)  # Approximate iteration count
-    if max_iterations < 1:
-        max_iterations = 1
-
-    for _ in range(max_iterations):
-        swarm.step()
-        gb = swarm.global_best()
-        convergence_history.append(gb.best_fitness)
-
-    return convergence_history
+    return swarm.history
 
 
 def run_experiment(
     objective_names: list[str] | None = None,
-    num_particles: int = 30,
-    dimension: int = 10,
     runs: int = RUNS_NO,
 ):
     """
-    Run the SOMA experiment for multiple objective functions, dimensions, and strategies.
-    Returns a nested dictionary: {objective: {dimension: {strategy: {run: [convergence_history]}}}}
+    Returns {objective: {dimension: {strategy: [convergence_history per run]}}}
     """
     if objective_names is None:
         objective_names = list(OBJECTIVES.keys())
 
+    if abs(1 / STEP - round(1 / STEP)) < 1e-9:
+        warnings.warn("STEP divides 1 exactly - particles will hit evaluated points")
+
     results: dict[str, dict[int, dict[str, list[list[float]]]]] = {}
 
-    for strategy in Strategy:
-        global STRATEGY
-        STRATEGY = strategy
+    for obj_name in objective_names:
+        obj_func, bounds = OBJECTIVES[obj_name]
+        results[obj_name] = {}
 
-        for obj_name in objective_names:
-            obj_func, bounds = OBJECTIVES[obj_name]
+        for dim in DIMENSIONS:
+            results[obj_name][dim] = {}
+            max_evals = EVALS_PER_DIM * dim
 
-            if obj_name not in results:
-                results[obj_name] = {}
-
-            for dim in DIMENSIONS:
-                if dim not in results[obj_name]:
-                    results[obj_name][dim] = {}
-
-                if strategy.value not in results[obj_name][dim]:
-                    results[obj_name][dim][strategy.value] = []
-
-                for _ in range(runs):
-                    max_evals = EVALS_PER_DIM * dim
-                    convergence_history = run_soma(obj_func, bounds, dim, max_evals)
-                    results[obj_name][dim][strategy.value].append(convergence_history)
+            for strategy in Strategy:
+                results[obj_name][dim][strategy.value] = [
+                    run_soma(obj_func, bounds, dim, max_evals, strategy)
+                    for _ in range(runs)
+                ]
+                print(f"done: {obj_name} dim={dim} {strategy.value}")
 
     return results
 
 
 def plot_results(results: dict, save_dir: str) -> None:
     """
-    Plot the convergence history for all objectives, averaged over runs.
+    Plot the convergence history (averaged over runs) for each objective.
     """
     os.makedirs(save_dir, exist_ok=True)
-
-    plt.figure(figsize=(12, 7))
 
     for obj_name, dims_data in results.items():
         plt.figure(figsize=(12, 7))
 
         for dim, strategies_data in dims_data.items():
             for strategy, runs_data in strategies_data.items():
-                # Average convergence across runs
+                length = min(len(run) for run in runs_data)
                 avg_history = [
-                    sum(run[i] for run in runs_data if i < len(run)) / len(runs_data)
-                    for i in range(max(len(run) for run in runs_data))
+                    sum(run[i] for run in runs_data) / len(runs_data)
+                    for i in range(length)
                 ]
-                label = f"{obj_name} dim={dim} {strategy}"
+                evals = [(i + 1) * LOG_EVERY for i in range(length)]
                 plt.plot(
+                    evals,
                     avg_history,
-                    label=label,
+                    label=f"dim={dim} {strategy}",
                     linestyle="--" if dim != min(dims_data.keys()) else "-",
                 )
 
         plt.title(f"Convergence: {obj_name}")
-        plt.xlabel("Iteration")
-        plt.ylabel("Best Fitness")
+        plt.xlabel("Function evaluations")
+        plt.ylabel("Best fitness (avg over runs)")
         plt.yscale("log")
         plt.grid(True)
         plt.legend()
@@ -255,9 +329,47 @@ def plot_results(results: dict, save_dir: str) -> None:
     print(f"Plots saved to {save_dir}")
 
 
+def make_tables(results: dict, save_path: str | None = None) -> str:
+    lines: list[str] = []
+
+    for obj_name, dims_data in results.items():
+        for dim, strategies_data in dims_data.items():
+            lines.append(f"##### {obj_name}, d={dim}")
+            lines.append("")
+            lines.append("| Method | Best | Worst | Mean | Median | Std |")
+            lines.append("|---|---:|---:|---:|---:|---:|")
+
+            for strategy, runs_data in strategies_data.items():
+                finals = [run[-1] for run in runs_data]
+                row = [
+                    min(finals),
+                    max(finals),
+                    statistics.mean(finals),
+                    statistics.median(finals),
+                    statistics.pstdev(finals),
+                ]
+                cells = " | ".join(f"{v:.4g}" for v in row)
+                lines.append(f"| {strategy.capitalize()} | {cells} |")
+
+            lines.append("")
+
+    table_md = "\n".join(lines)
+    print(table_md)
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(table_md)
+        print(f"Tables saved to {save_path}")
+
+    return table_md
+
+
 def main():
+    random.seed(SEED)
     results = run_experiment(objective_names=list(OBJECTIVES.keys()))
     plot_results(results, "./doc")
+    make_tables(results, "./doc/results.md")
 
 
 if __name__ == "__main__":
